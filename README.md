@@ -12,18 +12,18 @@ The system is designed to be universal and scenario-agnostic, meaning it does no
 
 # ✨ Main Features
 
-Feature| Description
-⚖️ Karma| Tracks significant moral actions performed by the player on a scale from -100 to 100
-🦸 Moral Alignment| Interprets the player's accumulated actions as Villainous, Ruthless, Neutral, Benevolent, or Heroic
-🗣️ Reputation| Tracks how the player is generally perceived by others
-👥 Public Perception| Influences whether NPCs tend toward fear, distrust, neutrality, respect, or admiration
-🚔 Authorities| Represents the general relationship between the player and authorities
-📜 Known Deeds| Records significant actions as concrete events rather than relying only on numerical values
-🧠 Knowledge Boundaries| Prevents NPCs from magically knowing about actions they could not plausibly know about
-🌎 Global NPC Influence| Allows the AI to naturally reflect the player's reputation in NPC behavior
-🔒 Player Agency| Never controls the player's thoughts, feelings, dialogue, decisions, or actions
-🔄 Universal Design| Works independently of any specific scenario setting or lore
-
+| Feature | Description |
+| --- | --- |
+| ☯️ Karma | Tracks significant moral actions performed by the player on a scale from -100 to 100 |
+| 🦸 Moral Alignment | Interprets the player's accumulated actions as Villainous, Ruthless, Neutral, Benevolent, or Heroic |
+| 🗣️ Reputation | Tracks how the player is generally perceived by others |
+| 👥 Public Perception | Influences whether NPCs tend toward fear, distrust, neutrality, respect, or admiration |
+| 🚔 Authorities | Represents the general relationship between the player and authorities |
+| 📜 Known Deeds | Records significant actions as concrete events rather than relying only on numerical values |
+| 🧠 Knowledge Boundaries | Prevents NPCs from magically knowing about actions they could not plausibly know about |
+| 🌎 Global NPC Influence | Allows the AI to naturally reflect the player's reputation in NPC behavior |
+| 🔒 Player Agency | Never controls the player's thoughts, feelings, dialogue, decisions, or actions |
+| 🔄 Universal Design | Works independently of any specific scenario setting or lore |
 ---
 
 # 🎭 What does it actually do?
