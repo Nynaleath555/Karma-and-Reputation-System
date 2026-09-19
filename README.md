@@ -72,16 +72,13 @@ This distinction is important because doing something good does not automaticall
 
 # 🧠 Knowledge & NPC Reactions
 
-The system uses different levels of knowledge:
+The system uses different levels of knowledge to determine what information NPCs can plausibly know.
 
-PLAYER HISTORY
-Everything the player has actually done.
-
-PUBLIC KNOWLEDGE
-What society could plausibly know about the player.
-
-NPC KNOWLEDGE
-What a specific NPC could plausibly know.
+| Knowledge Level | Description |
+| --- | --- |
+| 👤 Player History | Everything the player has actually done. |
+| 🌎 Public Knowledge | What society could plausibly know about the player. |
+| 👥 NPC Knowledge | What a specific NPC could plausibly know. |
 
 NPCs are therefore not supposed to magically know about secret actions.
 
@@ -89,12 +86,12 @@ For example, if the player secretly saves someone in an isolated location with n
 
 The system instead encourages the AI to consider plausible sources of information such as:
 
-- witnesses
-- cameras
-- news reports
-- police reports
-- other NPCs
-- information directly revealed by the player
+- 👁️ Witnesses
+- 📹 Cameras
+- 📰 News reports
+- 🚔 Police reports
+- 🗣️ Other NPCs
+- 💬 Information directly revealed by the player
 
 ---
 
@@ -102,32 +99,33 @@ The system instead encourages the AI to consider plausible sources of informatio
 
 Karma ranges from -100 to +100.
 
-Karma| Moral Alignment
--100 to -70| Villainous
--69 to -30| Ruthless
--29 to +29| Neutral
-+30 to +69| Benevolent
-+70 to +100| Heroic
+| Karma | Moral Alignment |
+| --- | --- |
+| -100 to -70 | Villainous |
+| -69 to -30 | Ruthless |
+| -29 to +29 | Neutral |
+| +30 to +69 | Benevolent |
+| +70 to +100 | Heroic |
 
-Reputation
+### 🗣️ Reputation
 
-Reputation| Level
--100 to -70| Infamous
--69 to -30| Feared
--29 to +29| Unknown
-+30 to +69| Respected
-+70 to +100| Admired
+| Reputation | Level |
+| --- | --- |
+| -100 to -70 | Infamous |
+| -69 to -30 | Feared |
+| -29 to +29 | Unknown |
+| +30 to +69 | Respected |
+| +70 to +100 | Admired |
 
-Public Perception
+### 👥 Public Perception
 
-Score| Perception
--100 to -50| Fear / Hostility
--49 to -1| Caution / Distrust
-0 to 39| Neutral
-40 to 74| Respect / Trust
-75 to 100| Admiration / Support
-
----
+| Score | Perception |
+| --- | --- |
+| -100 to -50 | Fear / Hostility |
+| -49 to -1 | Caution / Distrust |
+| 0 to 39 | Neutral |
+| 40 to 74 | Respect / Trust |
+| 75 to 100 | Admiration / Support |
 
 # 📝 Important Design Principles
 
