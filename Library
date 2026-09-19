@@ -1,0 +1,2689 @@
+/// <reference no-default-lib="true"/>
+/// <reference lib="es2022"/>
+
+// ⚖️ KARMA & REPUTATION SYSTEM — v1
+// Universal AI Dungeon script.
+// Paste this file into the Library tab.
+// Hook files call AID_KARMA.input(), AID_KARMA.context(), and AID_KARMA.output().
+
+const AID_KARMA_CONFIG = {
+  version: 4,
+
+  min: -100,
+  max: 100,
+  start: 0,
+
+  maxEvents: 20,
+  maxDeeds: 12,
+  maxProcessedKeys: 32,
+
+  cardEnabled: true,
+  cardKey: "%AID_KARMA%",
+  cardType: "Karma System",
+  cardHeader: "⚖️ KARMA & REPUTATION",
+
+  injectFrontMemory: true,
+  debug: false,
+
+  maxActiveSceneTurns: 3,
+};
+
+const AID_KARMA = (() => {
+  const VERSION = AID_KARMA_CONFIG.version;
+  const SENTINEL = AID_KARMA_CONFIG.cardKey;
+  const FRONT_START = "[AID_KARMA_START]";
+  const FRONT_END = "[AID_KARMA_END]";
+  const CONTEXT_START = "[AID_KARMA_CONTEXT]";
+  const CONTEXT_END = "[/AID_KARMA_CONTEXT]";
+
+  // ---------------------------------------------------------------------------
+  // Utilities
+  // ---------------------------------------------------------------------------
+
+  const isNum = (v) => typeof v === "number" && Number.isFinite(v);
+  const clamp = (v, lo, hi) =>
+    !isNum(v) ? lo : Math.max(lo, Math.min(hi, v));
+
+  const cleanText = (v) =>
+    String(v ?? "").replace(/\s+/g, " ").trim();
+
+  const lower = (v) => cleanText(v).toLowerCase();
+
+  const cap = (v) => {
+    const s = cleanText(v);
+    return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+  };
+
+  const hash32 = (value) => {
+    const s = String(value ?? "");
+    let h = 2166136261;
+
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h =
+        (h +
+          ((h << 1) +
+            (h << 4) +
+            (h << 7) +
+            (h << 8) +
+            (h << 24))) >>>
+        0;
+    }
+
+    return h >>> 0;
+  };
+
+  const escapeRegex = (value) =>
+    String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  const safeLog = (...args) => {
+    if (!AID_KARMA_CONFIG.debug) return;
+
+    try {
+      log(
+        "[Karma] " +
+          args
+            .map((x) => {
+              if (typeof x === "string") return x;
+
+              try {
+                return JSON.stringify(x);
+              } catch (_) {
+                return String(x);
+              }
+            })
+            .join(" ")
+      );
+    } catch (_) {}
+  };
+
+  const localClause = (src, at) => {
+    const text = String(src ?? "");
+    const start = Math.max(0, at - 120);
+    const tail = text.slice(start, at);
+
+    const cut = tail.search(/[.!?;:\n][^.!?;:\n]*$/);
+
+    return cut >= 0 ? tail.slice(cut + 1) : tail;
+  };
+
+  const sentenceAt = (src, at) => {
+    const text = String(src ?? "");
+
+    const starts = [
+      text.lastIndexOf(".", at - 1),
+      text.lastIndexOf("!", at - 1),
+      text.lastIndexOf("?", at - 1),
+      text.lastIndexOf("\n", at - 1),
+    ];
+
+    const start = Math.max(...starts) + 1;
+
+    const ends = [
+      text.indexOf(".", at),
+      text.indexOf("!", at),
+      text.indexOf("?", at),
+      text.indexOf("\n", at),
+    ].filter((x) => x >= 0);
+
+    const end = ends.length ? Math.min(...ends) : text.length;
+
+    return text.slice(start, end).trim();
+  };
+
+  // ---------------------------------------------------------------------------
+  // Narrative-context filters
+  // ---------------------------------------------------------------------------
+
+  const NEGATORS =
+    /\b(?:not|never|cannot|can't|won't|wouldn't|don't|doesn't|didn't|refus\w*|declin\w*|avoid\w*|without|instead of|rather than|unable to|fail\w* to|failed to|decid\w* against)\b/i;
+
+  const ATTEMPT_WORDS =
+    /\b(?:try|tries|tried|attempt|attempted|attempts|plan(?:ned)? to)\b/i;
+
+  const HISTORICAL_MARKERS =
+    /\b(?:years? ago|months? ago|weeks? ago|days? ago|last year|last month|last week|in the past|in my past|in his past|in her past|back then|long ago|when i was younger|when we were younger|when i was young|when we were young|once upon a time|previously|formerly|earlier|before the story began|before this story began|before the game began|before we met|before you met|before they met|as a child|as a teenager|growing up|years? earlier|months? earlier|weeks? earlier|days? earlier|before returning to the present|before the present|before reality changed|in the timeline i remember|in the timeline you remember)\b/i;
+
+  const TIME_TRAVEL_PAST =
+    /\b(?:travel(?:ed|led)?|went|go|returned|return(?:ed|ing)?|was sent|had been sent|sent|transport(?:ed|ing)?|thrown|threw)\b[\s\S]{0,120}\b(?:into|back|in)\s+the\s+past\b/i;
+
+  const TIME_TRAVEL_ALTERNATES =
+    /\b(?:time[- ]travel(?:ed|led)?|traveled back in time|travelled back in time|went back in time|returned to the past|returned from the past)\b/i;
+
+  const FLASHBACK_MARKERS =
+    /\b(?:flashback|flash back|memory|memories|remembered|remembering|recalled|recalling|dreamed of|dreams of)\b/i;
+
+  const HYPOTHETICAL_MARKERS =
+    /\b(?:if|unless|would|could|might|may|should|imagine|suppose|hypothetically|what if|i would|i could|i might|i may|i should|i plan to|i intend to|i want to|i hope to|i am going to|i'm going to)\b/i;
+
+  const isNegated = (src, at) =>
+    NEGATORS.test(localClause(src, at));
+
+  const isAttempted = (src, at) =>
+    ATTEMPT_WORDS.test(localClause(src, at));
+
+  const isHistorical = (src, at) => {
+    const sentence = sentenceAt(src, at);
+    const before = localClause(src, at);
+    const combined = `${sentence} ${before}`;
+
+    if (TIME_TRAVEL_PAST.test(combined)) return true;
+    if (TIME_TRAVEL_ALTERNATES.test(combined)) return true;
+    if (HISTORICAL_MARKERS.test(combined)) return true;
+    if (FLASHBACK_MARKERS.test(combined)) return true;
+
+    if (
+      /\b(?:you|i)\s+(?:had|had already|used to)\b/i.test(
+        combined
+      )
+    ) {
+      return true;
+    }
+
+    return false;
+  };
+
+  const isHypothetical = (src, at) => {
+    const sentence = sentenceAt(src, at);
+    const before = localClause(src, at);
+
+    return HYPOTHETICAL_MARKERS.test(
+      `${sentence} ${before}`
+    );
+  };
+
+  const PREVENTIVE =
+    /\b(?:stop(?:ped|s)?|prevent(?:ed|s)?|defus(?:e|ed|es|ing)|disarm(?:ed|s|ing)?|save(?:d|s|ing)?)\b[\s\S]{0,60}$/i;
+
+  const isPrevented = (src, at) =>
+    PREVENTIVE.test(localClause(src, at));
+
+  const OBSERVING =
+    /\b(?:watch(?:es|ed|ing)?|witness(?:ed|es|ing)?|observ(?:e|ed|es|ing)|see(?:s|ing|n)?|saw|hear(?:d|s|ing)?|listen(?:ed|s|ing)?)\b/i;
+
+  const OTHER_ACTOR =
+    /\b(?:he|she|they|someone else|the villain|the enemy|the guard|the criminal|the officer|the soldier|a man|a woman|a person|another)\b/i;
+
+  const isObservedAnotherActor = (src, at) => {
+    const clause = localClause(src, at);
+
+    return (
+      OBSERVING.test(clause) &&
+      OTHER_ACTOR.test(clause)
+    );
+  };
+
+  // ---------------------------------------------------------------------------
+  // Player agency detection
+  // ---------------------------------------------------------------------------
+
+  const PLAYER_PRONOUN =
+    /\b(?:i|i'm|i am|i'd|i'll|i have|i had|i've|my|mine|me|you|your|the player|player character)\b/i;
+
+  const PLAYER_ACTION_START =
+    /^(?:save|rescue|help|protect|defend|shield|spare|forgive|arrest|capture|stop|prevent|defuse|disarm|kill|murder|attack|assault|steal|rob|burn|destroy|kidnap|torture|threaten|betray|sabotage|throw|push|pull|hit|strike|shoot|stab|use|grab|carry|lead|guide|escort|evacuate)\b/i;
+
+  const PLAYER_ACTION_WORDS =
+    /(?:save|rescue|help|protect|defend|shield|spare|forgive|arrest|capture|stop|prevent|defuse|disarm|kill|murder|attack|assault|steal|rob|burn|destroy|kidnap|torture|threaten|betray|sabotage|throw|push|pull|hit|strike|shoot|stab|use|grab|carry|lead|guide|escort|evacuate)\b/i;
+
+  const playerSubjectLikely = (text) => {
+    const s = String(text ?? "").trim();
+
+    if (!s) return false;
+
+    if (PLAYER_PRONOUN.test(s)) return true;
+
+    if (PLAYER_ACTION_START.test(s)) return true;
+
+    // More permissive than v3:
+    // detect player agency anywhere in the input rather than only
+    // at the beginning.
+    if (
+      /\b(?:i|you|we|my character|the player|player character)\b[\s\S]{0,220}?(?:save|rescue|help|protect|defend|shield|spare|forgive|arrest|capture|stop|prevent|defuse|disarm|kill|murder|attack|assault|steal|rob|burn|destroy|kidnap|torture|threaten|betray|sabotage|throw|push|pull|hit|strike|shoot|stab|use|grab|carry|lead|guide|escort|evacuate)\b/i.test(
+        s
+      )
+    ) {
+      return true;
+    }
+
+    return false;
+  };
+
+  const findFirstMatch = (text, patterns) => {
+    const src = String(text ?? "");
+
+    for (const re of patterns) {
+      re.lastIndex = 0;
+
+      const m = re.exec(src);
+
+      if (m) {
+        return {
+          match: m[0],
+          index: m.index,
+        };
+      }
+    }
+
+    return null;
+  };
+
+  const playerOwnsMatch = (text, index) => {
+    const src = String(text ?? "");
+    const clause = localClause(src, index);
+
+    if (PLAYER_PRONOUN.test(clause)) return true;
+
+    if (
+      index <= 12 &&
+      PLAYER_ACTION_START.test(cleanText(src))
+    ) {
+      return true;
+    }
+
+    const sentence = sentenceAt(src, index);
+
+    const tail = sentence.slice(
+      0,
+      Math.max(
+        0,
+        sentence.length -
+          String(src).slice(index).length
+      )
+    );
+
+    if (PLAYER_PRONOUN.test(tail)) return true;
+
+    // Player agency anywhere in the same sentence.
+    if (
+      PLAYER_PRONOUN.test(sentence) &&
+      PLAYER_ACTION_WORDS.test(sentence)
+    ) {
+      return true;
+    }
+
+    return false;
+  };
+
+  // ---------------------------------------------------------------------------
+  // Action rules
+  // ---------------------------------------------------------------------------
+
+  const ACTION_RULES = [
+    {
+      id: "terrorism",
+      delta: -55,
+      label: "committed a terrorist attack",
+      verb: "commit a terrorist attack",
+      group: "extreme",
+
+      patterns: [
+        /\bterror(?:ist|ism)\b/i,
+
+        /\b(?:bombed|bombing|bombs|detonated|detonate|explod(?:ed|ing|e)|massacre|mass killing|mass murder)\b/i,
+      ],
+    },
+
+    // -----------------------------------------------------------------------
+    // RESCUE / PROTECTION
+    // -----------------------------------------------------------------------
+
+    {
+      id: "rescue_compound",
+      delta: 18,
+      label: "rescued someone from danger",
+      verb: "rescue someone from danger",
+      group: "good_major",
+
+      patterns: [
+        /\b(?:help(?:ed|s|ing)?|assist(?:ed|s|ing)?)\s+(?:you|him|her|them|someone|somebody|a person|the victim|the civilian|the woman|the man|[A-Z][a-z]+)\b[\s\S]{0,55}\b(?:escap(?:e|ed|es|ing)|scap(?:e|ed|es|ing)|get away|flee|fled|get out)\b/i,
+
+        /\b(?:help(?:ed|s|ing)?|assist(?:ed|s|ing)?)\s+(?:him|her|them|someone|somebody|the victim|the civilian|the woman|the man|[A-Z][a-z]+)\s+(?:to|toward|towards)\s+(?:safety|escape|an exit)\b/i,
+
+        /\b(?:get|got|getting|lead|led|leading|guide|guided|guiding|escort|escorted|escorting|carry|carried|carrying|pull|pulled|pulling)\s+(?:him|her|them|someone|somebody|the victim|the civilian|the woman|the man|[A-Z][a-z]+)\s+(?:to|into|out of|away from)\s+(?:safety|danger|the danger|the area|there|here)\b/i,
+
+        /\b(?:save[sd]?|rescue[sd]?|protect(?:ed|s|ing)?|defend(?:ed|s|ing)?|shield(?:ed|s|ing)?)\s+(?:him|her|them|someone|somebody|the victim|the civilian|the woman|the man|[A-Z][a-z]+)\b[\s\S]{0,60}\b(?:attacker|attackers|assailant|assailants|mugger|muggers|criminal|criminals|threat|danger|being attacked)\b/i,
+
+        /\b(?:drive|drove|driving|force|forced|forcing|push|pushed|pushing)\s+(?:the|his|her|their)?\s*(?:attacker|attackers|assailant|assailants|mugger|muggers|criminal|criminals)\s+(?:away|back|off)\b/i,
+
+        /\b(?:stop(?:ped|s)?|prevent(?:ed|s)?)\s+(?:the|an?|two|three|several|the two)?\s*(?:attacker|attackers|assailant|assailants|mugger|muggers)\b/i,
+      ],
+    },
+
+    {
+      id: "rescue",
+      delta: 18,
+      label: "rescued someone",
+      verb: "rescue someone",
+      group: "good_major",
+
+      patterns: [
+        /\b(?:rescue[sd]?|saved|save|saving|pull(?:ed|s)? .* to safety|carried .* to safety|evacuated|evacuate)\b/i,
+      ],
+    },
+
+    {
+      id: "prevent_crime",
+      delta: 14,
+      label: "prevented a crime or stopped a dangerous act",
+      verb: "prevent or stop a dangerous act",
+      group: "good_major",
+
+      patterns: [
+        /\b(?:prevent(?:ed|s)?|stop(?:ped|s)?|thwart(?:ed|s)?|foiled)\b[\s\S]{0,45}\b(?:murder|kill|bomb|robber|robbery|attack|crime|explosion|kidnap|hostage|shoot)\w*/i,
+
+        /\b(?:defus(?:ed|es|e)|disarm(?:ed|s|ing)?)\b[\s\S]{0,40}\b(?:bomb|explosive|device|mine)\b/i,
+      ],
+    },
+
+    {
+      id: "protect",
+      delta: 12,
+      label: "protected or defended someone",
+      verb: "protect or defend someone",
+      group: "good_major",
+
+      patterns: [
+        /\b(?:protect(?:ed|s|ing)?|defend(?:ed|s|ing)?|shield(?:ed|s|ing)?)\b/i,
+      ],
+    },
+
+    {
+      id: "mercy",
+      delta: 10,
+      label: "showed mercy",
+      verb: "show mercy",
+      group: "good_major",
+
+      patterns: [
+        /\b(?:spare[sd]?|showed mercy|show mercy|forgave|forgive|let .* live|released .* prisoner)\b/i,
+      ],
+    },
+
+    {
+      id: "help",
+      delta: 7,
+      label: "helped someone in need",
+      verb: "help someone in need",
+      group: "good_minor",
+
+      patterns: [
+        /\b(?:help(?:ed|s|ing)?|aid(?:ed|s|ing)?|assist(?:ed|s|ing)?|comfort(?:ed|s|ing)?|cared for|tend(?:ed|s|ing) to)\b/i,
+      ],
+    },
+
+    {
+      id: "charity",
+      delta: 6,
+      label: "gave resources to help someone",
+      verb: "give resources to help someone",
+      group: "good_minor",
+
+      patterns: [
+        /\b(?:donat(?:ed|e|es|ing)|gave .* (?:money|food|water|medicine|supplies)|returned .* (?:money|wallet|property)|paid for .* food)\b/i,
+      ],
+    },
+
+    {
+      id: "arrest_criminal",
+      delta: 11,
+      label: "helped bring a criminal to justice",
+      verb: "bring a criminal to justice",
+      group: "good_major",
+
+      patterns: [
+        /\b(?:arrest(?:ed|s|ing)?|apprehend(?:ed|s|ing)?|capture[sd]?|turned .* over to (?:the )?(?:police|authorities))\b/i,
+      ],
+    },
+
+    // -----------------------------------------------------------------------
+    // NEGATIVE ACTIONS
+    // -----------------------------------------------------------------------
+
+    {
+      id: "murder",
+      delta: -20,
+      label: "killed someone",
+      verb: "kill someone",
+      group: "extreme",
+
+      patterns: [
+        /\b(?:kill(?:ed|s|ing)?|murder(?:ed|s|ing)?|execute[sd]?|assassinat(?:ed|es|e)|slaughter(?:ed|s|ing)?)\b/i,
+      ],
+    },
+
+    {
+      id: "torture",
+      delta: -42,
+      label: "tortured or abused someone",
+      verb: "torture or abuse someone",
+      group: "extreme",
+
+      patterns: [
+        /\b(?:tortur(?:ed|e|ing|es)|abused|abuse|beaten|beat|mutilat(?:ed|e|ing)|burn(?:ed|ing)? .* (?:alive|on purpose))\b/i,
+      ],
+    },
+
+    {
+      id: "kidnap",
+      delta: -26,
+      label: "kidnapped or held someone against their will",
+      verb: "kidnap or imprison someone",
+      group: "major_bad",
+
+      patterns: [
+        /\b(?:kidnap(?:ped|s|ping)?|abduct(?:ed|s|ing)?|took .* hostage|held .* hostage|imprison(?:ed|s|ing) .* against .* will)\b/i,
+      ],
+    },
+
+    {
+      id: "robbery",
+      delta: -14,
+      label: "stole or robbed someone",
+      verb: "steal or rob someone",
+      group: "major_bad",
+
+      patterns: [
+        /\b(?:steal(?:s|ing|en)?|stole|rob(?:bed|s|bing)?|mug(?:ged|s|ging)?|burglar(?:ized|ize|izes|izing))\b/i,
+      ],
+    },
+
+    {
+      id: "betrayal",
+      delta: -15,
+      label: "betrayed someone",
+      verb: "betray someone",
+      group: "major_bad",
+
+      patterns: [
+        /\b(?:betray(?:ed|s|ing)?|double-cross(?:ed|s|ing)?|backstab(?:bed|s|bing)?)\b/i,
+      ],
+    },
+
+    {
+      id: "threat",
+      delta: -7,
+      label: "threatened or intimidated someone",
+      verb: "threaten or intimidate someone",
+      group: "bad_minor",
+
+      patterns: [
+        /\b(?:threaten(?:ed|s|ing)?|intimidat(?:ed|e|ing|es)|blackmail(?:ed|s|ing)?)\b/i,
+      ],
+    },
+
+    {
+      id: "assault",
+      delta: -9,
+      label: "physically attacked someone",
+      verb: "attack someone",
+      group: "bad_minor",
+
+      patterns: [
+        /\b(?:attack(?:ed|s|ing)?|assault(?:ed|s|ing)?|punch(?:ed|es|ing)?|kick(?:ed|s|ing)?|struck|stab(?:bed|s|bing)?|shot|shoot(?:s|ing)? .* (?:at|him|her|them))\b/i,
+      ],
+    },
+
+    {
+      id: "destruction",
+      delta: -25,
+      label: "deliberately destroyed property",
+      verb: "deliberately destroy property",
+      group: "major_bad",
+
+      patterns: [
+        /\b(?:destroy(?:ed|s|ing)?|demolish(?:ed|es|ing)?|burn(?:ed|s|ing)? down|set .* on fire|arson)\b/i,
+      ],
+    },
+
+    {
+      id: "sabotage",
+      delta: -14,
+      label: "sabotaged something",
+      verb: "sabotage something",
+      group: "major_bad",
+
+      patterns: [
+        /\bsabotag(?:ed|e|es|ing)\b/i,
+      ],
+    },
+  ];
+
+  // ---------------------------------------------------------------------------
+  // Visibility / consequences
+  // ---------------------------------------------------------------------------
+
+  const PUBLIC_INDICATORS = [
+    /\b(?:news|newspaper|reporters?|journalists?|broadcast|television|tv|radio|viral|social media|internet)\b/i,
+
+    /\b(?:camera|cameras|security footage|recorded|video footage|livestream)\b/i,
+
+    /\b(?:police report|official report|authorities reported|government statement)\b/i,
+
+    /\b(?:crowd|thousands?|hundreds?|dozens? of people|everyone saw|witnesses?)\b/i,
+  ];
+
+  const SECRET_INDICATORS = [
+    /\b(?:secretly|unseen|undetected|without witnesses?|no witnesses?|nobody saw|no one saw|nobody knows|no one knows|alone|in secret|hidden|concealed|covered it up|cover it up|left no evidence)\b/i,
+  ];
+
+  const FAILURE_INDICATORS =
+    /\b(?:failed|missed|didn't succeed|did not succeed|too late|was stopped|was prevented|couldn't|could not|was unable to)\b/i;
+
+  const POSITIVE_OUTCOME =
+    /\b(?:saved|rescued|survived|safe|alive|protected|evacuated)\b/i;
+
+  const inferVisibility = (input, output) => {
+    const combined = `${input || ""} ${output || ""}`;
+
+    if (
+      PUBLIC_INDICATORS.some((re) =>
+        re.test(combined)
+      )
+    ) {
+      return "public";
+    }
+
+    if (
+      SECRET_INDICATORS.some((re) =>
+        re.test(combined)
+      )
+    ) {
+      return "private";
+    }
+
+    return "witnessed";
+  };
+
+  const extractConsequenceCounts = (output) => {
+    const src = cleanText(output);
+
+    let casualties = 0;
+    let saved = 0;
+    let injured = 0;
+
+    const numberWords = {
+      a: 1,
+      one: 1,
+      two: 2,
+      three: 3,
+      four: 4,
+      five: 5,
+      six: 6,
+      seven: 7,
+      eight: 8,
+      nine: 9,
+      ten: 10,
+      dozen: 12,
+      dozens: 12,
+      scores: 20,
+      hundreds: 100,
+      thousands: 1000,
+    };
+
+    const addMatches = (re, target) => {
+      re.lastIndex = 0;
+
+      let m;
+
+      while ((m = re.exec(src)) !== null) {
+        const token = String(m[1] || "")
+          .toLowerCase()
+          .replace(/,/g, "");
+
+        const n = /^\d+$/.test(token)
+          ? Number(token)
+          : numberWords[token] || 1;
+
+        if (target === "casualties") casualties += n;
+        else if (target === "saved") saved += n;
+        else if (target === "injured") injured += n;
+      }
+    };
+
+    const qty =
+      /(\d{1,3}(?:,\d{3})*|one|two|three|four|five|six|seven|eight|nine|ten|dozen|dozens|scores|hundreds|thousands)/;
+
+    addMatches(
+      new RegExp(
+        `\\b${qty.source}\\s+(?:people|civilians|bystanders|victims|persons)\\s+(?:were\\s+)?(?:killed|dead|died|die)\\b`,
+        "gi"
+      ),
+      "casualties"
+    );
+
+    addMatches(
+      new RegExp(
+        `\\b(?:kill(?:s|ed|ing)?|murder(?:s|ed|ing)?|slaughter(?:s|ed|ing)?)\\s+${qty.source}\\s+(?:people|civilians|bystanders|victims|persons)\\b`,
+        "gi"
+      ),
+      "casualties"
+    );
+
+    addMatches(
+      new RegExp(
+        `\\b${qty.source}\\s+(?:people|civilians|bystanders|victims|persons)\\s+(?:were\\s+)?(?:saved|rescued|evacuated)\\b`,
+        "gi"
+      ),
+      "saved"
+    );
+
+    addMatches(
+      new RegExp(
+        `\\b(?:save[sd]?|rescue[sd]?|evacuat(?:ed|es|e))\\s+${qty.source}\\s+(?:people|civilians|bystanders|victims|persons)\\b`,
+        "gi"
+      ),
+      "saved"
+    );
+
+    addMatches(
+      new RegExp(
+        `\\b${qty.source}\\s+(?:people|civilians|bystanders|victims|persons)\\s+(?:were\\s+)?(?:injured|wounded)\\b`,
+        "gi"
+      ),
+      "injured"
+    );
+
+    if (
+      !casualties &&
+      /\b(?:someone|a civilian|a bystander|a victim)\b[\s\S]{0,60}\b(?:killed|died|dies|dead)\b/i.test(
+        src
+      )
+    ) {
+      casualties = 1;
+    }
+
+    if (
+      !saved &&
+      /\b(?:someone|a civilian|a bystander|a victim)\b[\s\S]{0,60}\b(?:saved|rescued|evacuated)\b/i.test(
+        src
+      )
+    ) {
+      saved = 1;
+    }
+
+    if (
+      !injured &&
+      /\b(?:someone|a civilian|a bystander|a victim)\b[\s\S]{0,60}\b(?:injured|wounded)\b/i.test(
+        src
+      )
+    ) {
+      injured = 1;
+    }
+
+    if (
+      /\b(?:dozens?|many)\b[\s\S]{0,40}\b(?:killed|died|dead)\b/i.test(
+        src
+      )
+    ) {
+      casualties = Math.max(casualties, 12);
+    }
+
+    if (
+      /\bhundreds?\b[\s\S]{0,40}\b(?:killed|died|dead)\b/i.test(
+        src
+      )
+    ) {
+      casualties = Math.max(casualties, 100);
+    }
+
+    return {
+      casualties,
+      saved,
+      injured,
+    };
+  };
+
+  // ---------------------------------------------------------------------------
+  // Killing evaluation
+  // ---------------------------------------------------------------------------
+
+  const evaluateKilling = (candidate, output) => {
+    const context = lower(
+      `${candidate.sentence || ""} ${output || ""}`
+    );
+
+    const clearlyUnjustified =
+      /\b(?:for fun|for pleasure|for sport|enjoyed killing|wanted to kill|cold[- ]blooded|innocent|unprovoked|helpless|defenseless|defenceless|revenge|execute an innocent|murder an innocent)\b/i.test(
+        context
+      );
+
+    const immediateThreat =
+      /\b(?:about to kill|trying to kill|attacking|attacking me|attacking us|shoot(?:ing)? at me|shoot(?:ing)? at us|threatening|immediate threat|life[- ]or[- ]death|deadly attack)\b/i.test(
+        context
+      );
+
+    const selfDefense =
+      /\b(?:self[- ]defense|self[- ]defence|defend(?:ed|ing)? myself|protect(?:ed|ing)? myself|defending myself|defend(?:ed|ing)? us|protect(?:ed|ing)? us)\b/i.test(
+        context
+      );
+
+    const protectingOthers =
+      /\b(?:protect(?:ed|ing)? (?:her|him|them|someone|others|people|civilians)|save(?:d|ing)? (?:her|him|them|someone|others|people|civilians)|defend(?:ed|ing)? (?:her|him|them|someone|others|people|civilians))\b/i.test(
+        context
+      );
+
+    const dangerousTarget =
+      /\b(?:terrorist|killer|murderer|mass murderer|serial killer|violent criminal|armed attacker|villain|enemy combatant|dangerous criminal)\b/i.test(
+        context
+      );
+
+    const revenge =
+      /\b(?:revenge|retaliation|payback|vengeance|avenged|avenge)\b/i.test(
+        context
+      );
+
+    const combat =
+      /\b(?:combat|battle|war|fight|fighting|soldier|enemy)\b/i.test(
+        context
+      );
+
+    if (clearlyUnjustified) return -32;
+    if (revenge) return -25;
+    if (selfDefense && immediateThreat) return -5;
+    if (selfDefense) return -7;
+    if (protectingOthers && immediateThreat) return -8;
+    if (dangerousTarget && immediateThreat) return -10;
+    if (dangerousTarget) return -12;
+    if (protectingOthers) return -10;
+    if (combat) return -15;
+
+    return -20;
+  };
+
+  // ---------------------------------------------------------------------------
+  // Defensive/rescue context
+  // ---------------------------------------------------------------------------
+
+  const DEFENSIVE_SCENE =
+    /\b(?:attacker|attackers|assailant|assailants|mugger|muggers|criminals?|men|man|woman|people)\b[\s\S]{0,120}\b(?:grabs?|grabbed|corners?|cornered|threatens?|threatened|attacks?|attacked|lunges?|lunged|tries? to hit|tries? to hurt|tries? to kill|tackles?|tackled|beats?|beaten|shoots?|shot|stabs?|stabbed)\b/i;
+
+  const PROTECTIVE_CONTEXT =
+    /\b(?:save|saved|rescue|rescued|protect|protected|defend|defended|shield|shielded|help|helped|escape|escaped|scap(?:e|ed|es|ing)|get away|get to safety|get her to safety|get him to safety|get them to safety|out of danger|safe|safely)\b/i;
+
+  const DEFENSIVE_FORCE =
+    /\b(?:push(?:ed|es|ing)?|throw(?:s|ing)?|threw|knock(?:ed|s|ing)?|repel(?:led|s|ing)?|drive(?:n|s)?|drove|force(?:d|s|ing)?|slam(?:med|s|ming)?|blast(?:ed|s|ing)?|hit(?:s|ting)?|strike(?:s|ing)?|kick(?:ed|s|ing)?|punch(?:ed|s|ing)?)\b/i;
+
+  const isDefensiveForceContext = (text) => {
+    const src = String(text ?? "");
+
+    const hasThreat =
+      DEFENSIVE_SCENE.test(src) ||
+      /\b(?:someone|a woman|a man|the victim|the civilian)\b[\s\S]{0,80}\b(?:attacked|grabbed|cornered|threatened|in danger)\b/i.test(
+        src
+      );
+
+    return (
+      hasThreat &&
+      PROTECTIVE_CONTEXT.test(src) &&
+      DEFENSIVE_FORCE.test(src)
+    );
+  };
+
+  // ---------------------------------------------------------------------------
+  // Rescue target extraction
+  // ---------------------------------------------------------------------------
+
+  const extractRescueTarget = (candidate, sourceText) => {
+    const src = cleanText(sourceText);
+
+    const patterns = [
+      /\b(?:help(?:ed|s|ing)?|assist(?:ed|s|ing)?)\s+([A-Z][a-z]+|him|her|them|someone|somebody|the victim|the civilian|the woman|the man)\b[\s\S]{0,55}\b(?:escape|escaped|escaping|scape|scaped|scaping|get away|flee|fled|get out)\b/i,
+
+      /\b(?:get|got|getting|lead|led|leading|guide|guided|guiding|escort|escorted|escorting|carry|carried|carrying|pull|pulled|pulling)\s+([A-Z][a-z]+|him|her|them|someone|somebody|the victim|the civilian|the woman|the man)\b[\s\S]{0,35}\b(?:safety|danger|the area|there|here)\b/i,
+
+      /\b(?:save[sd]?|rescue[sd]?|protect(?:ed|s|ing)?|defend(?:ed|s|ing)?|shield(?:ed|s|ing)?)\s+([A-Z][a-z]+|him|her|them|someone|somebody|the victim|the civilian|the woman|the man)\b/i,
+    ];
+
+    for (const re of patterns) {
+      const m = re.exec(src);
+
+      if (m && m[1]) {
+        return cleanText(m[1]);
+      }
+    }
+
+    return "";
+  };
+
+  const normalizeTarget = (value) =>
+    cleanText(value)
+      .toLowerCase()
+      .replace(/^(?:the|a|an)\s+/, "");
+
+  // ---------------------------------------------------------------------------
+  // Candidate descriptions
+  // ---------------------------------------------------------------------------
+
+  const buildActionDescription = (candidate) => {
+    const rule = candidate.rule;
+    const sentence = cleanText(candidate.sentence);
+    const matched = cleanText(candidate.matched);
+
+    let target = "";
+
+    if (sentence && matched) {
+      const idx = sentence
+        .toLowerCase()
+        .indexOf(matched.toLowerCase());
+
+      if (idx >= 0) {
+        target = sentence
+          .slice(idx + matched.length)
+          .trim();
+
+        target = target
+          .split(
+            /\b(?:and then|then|and)\b|[,.!?;]/i
+          )[0]
+          .trim();
+
+        target = target
+          .replace(
+            /^(?:to|at|on|for|from|into|with)\s+/i,
+            ""
+          )
+          .trim();
+      }
+    }
+
+    let desc = rule.label;
+
+    const rescueTarget =
+      candidate.target ||
+      extractRescueTarget(candidate, sentence);
+
+    if (
+      rule.id === "rescue_compound" ||
+      rule.id === "rescue"
+    ) {
+      if (
+        rescueTarget &&
+        !/^(?:someone|something|the scene)$/i.test(
+          rescueTarget
+        )
+      ) {
+        desc = `Rescued ${rescueTarget} from danger`;
+      } else {
+        desc = "Rescued someone from danger";
+      }
+    } else if (
+      rule.id === "protect" &&
+      rescueTarget
+    ) {
+      desc = `Protected ${rescueTarget} from danger`;
+    } else if (
+      target &&
+      target.length <= 55 &&
+      !/^(?:someone|something|the scene)$/i.test(
+        target
+      )
+    ) {
+      desc += `: ${target}`;
+    }
+
+    if (candidate.attempted) {
+      let attempted =
+        rule.verb || rule.label;
+
+      if (
+        target &&
+        target.length <= 55 &&
+        !/^(?:someone|something|the scene)$/i.test(
+          target
+        )
+      ) {
+        attempted += `: ${target}`;
+      }
+
+      desc = `Attempted to ${attempted}`;
+    }
+
+    return cap(desc) + ".";
+  };
+
+  // ---------------------------------------------------------------------------
+  // Candidate detection
+  // ---------------------------------------------------------------------------
+
+  const detectCandidates = (input) => {
+    const text = cleanText(input);
+
+    if (
+      !text ||
+      !playerSubjectLikely(text)
+    ) {
+      return [];
+    }
+
+    const candidates = [];
+
+    for (const rule of ACTION_RULES) {
+      const found = findFirstMatch(
+        text,
+        rule.patterns
+      );
+
+      if (!found) continue;
+
+      if (isHistorical(text, found.index)) continue;
+      if (isHypothetical(text, found.index)) continue;
+      if (isNegated(text, found.index)) continue;
+      if (isPrevented(text, found.index)) continue;
+      if (
+        isObservedAnotherActor(
+          text,
+          found.index
+        )
+      ) {
+        continue;
+      }
+
+      if (
+        !playerOwnsMatch(
+          text,
+          found.index
+        )
+      ) {
+        continue;
+      }
+
+      const sentence = sentenceAt(
+        text,
+        found.index
+      );
+
+      const attempted = isAttempted(
+        text,
+        found.index
+      );
+
+      let delta = rule.delta;
+
+      if (rule.id === "murder") {
+        delta = evaluateKilling(
+          {
+            sentence,
+            matched: found.match,
+          },
+          ""
+        );
+      }
+
+      if (attempted) {
+        delta = Math.round(
+          delta * 0.35
+        );
+      }
+
+      candidates.push({
+        rule,
+        matched: found.match,
+        index: found.index,
+        sentence,
+        attempted,
+        delta,
+        target: extractRescueTarget(
+          null,
+          text
+        ),
+        description: "",
+      });
+    }
+
+    if (!candidates.length) {
+      return [];
+    }
+
+    const hasRescue =
+      candidates.some(
+        (c) =>
+          c.rule.id ===
+            "rescue_compound" ||
+          c.rule.id === "rescue"
+      );
+
+    const defensiveScene =
+      isDefensiveForceContext(text);
+
+    // One rescue/protection sequence = one moral event.
+    let filtered = candidates.filter(
+      (c) => {
+        if (
+          hasRescue &&
+          [
+            "protect",
+            "help",
+            "prevent_crime",
+            "assault",
+            "destruction",
+          ].includes(c.rule.id)
+        ) {
+          return false;
+        }
+
+        if (
+          defensiveScene &&
+          [
+            "assault",
+            "destruction",
+          ].includes(c.rule.id)
+        ) {
+          return false;
+        }
+
+        return true;
+      }
+    );
+
+    const maxMagnitude = Math.max(
+      ...filtered.map((c) =>
+        Math.abs(c.delta)
+      ),
+      0
+    );
+
+    filtered = filtered.filter(
+      (c) => {
+        if (
+          maxMagnitude >= 25 &&
+          Math.abs(c.delta) <= 14 &&
+          c.delta * maxMagnitude > 0
+        ) {
+          return false;
+        }
+
+        return true;
+      }
+    );
+
+    filtered.sort((a, b) => {
+      const rank = (c) =>
+        c.rule.id ===
+        "rescue_compound"
+          ? 3
+          : c.rule.id === "rescue"
+          ? 2
+          : 0;
+
+      return (
+        rank(b) - rank(a) ||
+        Math.abs(b.delta) -
+          Math.abs(a.delta)
+      );
+    });
+
+    const chosen =
+      filtered.slice(0, 2);
+
+    for (const c of chosen) {
+      c.description =
+        buildActionDescription(c);
+    }
+
+    return chosen;
+  };
+
+  // ---------------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------------
+
+  const freshState = () => ({
+    v: VERSION,
+
+    karma: clamp(
+      AID_KARMA_CONFIG.start,
+      AID_KARMA_CONFIG.min,
+      AID_KARMA_CONFIG.max
+    ),
+
+    publicScore: 0,
+
+    events: [],
+    deeds: [],
+    processed: [],
+
+    pending: null,
+    activeScene: null,
+
+    turn: 0,
+    cardIndex: -1,
+  });
+
+  const normalizeState = (s) => {
+    if (
+      !s ||
+      typeof s !== "object" ||
+      Array.isArray(s)
+    ) {
+      return freshState();
+    }
+
+    if (!isNum(s.karma)) {
+      s.karma =
+        AID_KARMA_CONFIG.start;
+    }
+
+    s.karma = clamp(
+      s.karma,
+      AID_KARMA_CONFIG.min,
+      AID_KARMA_CONFIG.max
+    );
+
+    if (!isNum(s.publicScore)) {
+      s.publicScore = 0;
+    }
+
+    s.publicScore = clamp(
+      s.publicScore,
+      -100,
+      100
+    );
+
+    if (!Array.isArray(s.events)) {
+      s.events = [];
+    }
+
+    if (!Array.isArray(s.deeds)) {
+      s.deeds = [];
+    }
+
+    if (!Array.isArray(s.processed)) {
+      s.processed = [];
+    }
+
+    if (
+      s.pending !== null &&
+      typeof s.pending !== "object"
+    ) {
+      s.pending = null;
+    }
+
+    if (
+      s.activeScene !== null &&
+      typeof s.activeScene !== "object"
+    ) {
+      s.activeScene = null;
+    }
+
+    if (!isNum(s.turn)) {
+      s.turn = 0;
+    }
+
+    if (!isNum(s.cardIndex)) {
+      s.cardIndex = -1;
+    }
+
+    s.events =
+      s.events.slice(
+        -AID_KARMA_CONFIG.maxEvents
+      );
+
+    s.deeds =
+      s.deeds.slice(
+        -AID_KARMA_CONFIG.maxDeeds
+      );
+
+    s.processed =
+      s.processed.slice(
+        -AID_KARMA_CONFIG.maxProcessedKeys
+      );
+
+    s.v = VERSION;
+
+    return s;
+  };
+
+  const ensureState = () => {
+    if (
+      !globalThis.state ||
+      typeof state !== "object" ||
+      Array.isArray(state)
+    ) {
+      throw new Error(
+        "AI Dungeon state is unavailable."
+      );
+    }
+
+    // Migrate older namespace.
+    if (
+      !state.aidKarma &&
+      state.AID_KARMA &&
+      typeof state.AID_KARMA ===
+        "object"
+    ) {
+      state.aidKarma =
+        state.AID_KARMA;
+    }
+
+    if (
+      !state.aidKarma ||
+      typeof state.aidKarma !==
+        "object" ||
+      Array.isArray(
+        state.aidKarma
+      )
+    ) {
+      state.aidKarma =
+        freshState();
+    }
+
+    return normalizeState(
+      state.aidKarma
+    );
+  };
+
+  const rememberProcessed = (
+    s,
+    key
+  ) => {
+    if (!key) return;
+
+    s.processed.push(key);
+
+    if (
+      s.processed.length >
+      AID_KARMA_CONFIG.maxProcessedKeys
+    ) {
+      s.processed.splice(
+        0,
+        s.processed.length -
+          AID_KARMA_CONFIG.maxProcessedKeys
+      );
+    }
+  };
+
+  const alreadyProcessed = (
+    s,
+    key
+  ) =>
+    !!key &&
+    s.processed.indexOf(key) >= 0;
+
+  const isRescueRule = (
+    candidate
+  ) =>
+    candidate &&
+    [
+      "rescue_compound",
+      "rescue",
+      "protect",
+    ].includes(
+      candidate.rule.id
+    );
+
+  const getCandidateTarget = (
+    candidate,
+    input
+  ) =>
+    normalizeTarget(
+      candidate &&
+        candidate.target
+        ? candidate.target
+        : extractRescueTarget(
+            candidate,
+            input
+          )
+    );
+
+  const isSameActiveRescue = (
+    s,
+    candidate,
+    input
+  ) => {
+    if (
+      !isRescueRule(candidate) ||
+      !s.activeScene ||
+      !s.activeScene.active
+    ) {
+      return false;
+    }
+
+    if (
+      s.turn -
+        s.activeScene.turn >
+      AID_KARMA_CONFIG.maxActiveSceneTurns
+    ) {
+      return false;
+    }
+
+    const currentTarget =
+      getCandidateTarget(
+        candidate,
+        input
+      );
+
+    const previousTarget =
+      normalizeTarget(
+        s.activeScene.target
+      );
+
+    if (
+      currentTarget &&
+      previousTarget
+    ) {
+      return (
+        currentTarget ===
+        previousTarget
+      );
+    }
+
+    return (
+      !currentTarget ||
+      !previousTarget
+    );
+  };
+
+  const updateActiveScene = (
+    s,
+    candidate,
+    input
+  ) => {
+    if (
+      !isRescueRule(candidate)
+    ) {
+      return;
+    }
+
+    s.activeScene = {
+      type: "rescue",
+      turn: s.turn,
+      active: true,
+      target:
+        getCandidateTarget(
+          candidate,
+          input
+        ),
+    };
+  };
+
+  // ---------------------------------------------------------------------------
+  // Outcome evaluation
+  // ---------------------------------------------------------------------------
+
+  const applyOutcome = (
+    candidate,
+    output
+  ) => {
+    let delta =
+      candidate.delta;
+
+    const consequence =
+      extractConsequenceCounts(
+        output
+      );
+
+    const out = lower(output);
+
+    if (
+      candidate.rule.id ===
+      "murder"
+    ) {
+      delta =
+        evaluateKilling(
+          candidate,
+          output
+        );
+
+      if (candidate.attempted) {
+        delta = Math.round(
+          delta * 0.35
+        );
+      }
+    }
+
+    if (
+      candidate.attempted &&
+      FAILURE_INDICATORS.test(out)
+    ) {
+      delta = Math.round(
+        delta * 0.7
+      );
+    }
+
+    if (delta > 0) {
+      if (
+        consequence.casualties >
+        0
+      ) {
+        delta -= Math.min(
+          20,
+          consequence.casualties *
+            3
+        );
+      }
+
+      if (
+        FAILURE_INDICATORS.test(
+          out
+        ) &&
+        !POSITIVE_OUTCOME.test(
+          out
+        )
+      ) {
+        delta = Math.min(
+          delta,
+          3
+        );
+      }
+
+      if (
+        consequence.saved > 1
+      ) {
+        delta += Math.min(
+          15,
+          (consequence.saved -
+            1) *
+            2
+        );
+      }
+    }
+
+    if (delta < 0) {
+      if (
+        consequence.casualties >
+        0
+      ) {
+        delta -= Math.min(
+          35,
+          consequence.casualties *
+            5
+        );
+      }
+
+      if (
+        consequence.injured >
+        0
+      ) {
+        delta -= Math.min(
+          15,
+          consequence.injured *
+            2
+        );
+      }
+
+      if (
+        consequence.casualties >=
+        10
+      ) {
+        delta = Math.min(
+          delta,
+          -60
+        );
+      }
+
+      if (
+        /\b(?:bomb|explosion|massacre|terrorist)\b/i.test(
+          out
+        ) &&
+        consequence.casualties >=
+          5
+      ) {
+        delta = Math.min(
+          delta,
+          -55
+        );
+      }
+    }
+
+    return {
+      delta: clamp(
+        Math.round(delta),
+        -60,
+        40
+      ),
+
+      consequence,
+    };
+  };
+
+  // ---------------------------------------------------------------------------
+  // Event creation
+  // ---------------------------------------------------------------------------
+
+  const addEvent = (
+    s,
+    input,
+    output,
+    candidate,
+    visibility,
+    eventKey,
+    fallback = false
+  ) => {
+    if (
+      alreadyProcessed(
+        s,
+        eventKey
+      )
+    ) {
+      return null;
+    }
+
+    // If this is part of the same active rescue,
+    // do not count it again.
+    if (
+      isSameActiveRescue(
+        s,
+        candidate,
+        input
+      )
+    ) {
+      rememberProcessed(
+        s,
+        eventKey
+      );
+
+      safeLog(
+        "merged related rescue action",
+        {
+          target:
+            getCandidateTarget(
+              candidate,
+              input
+            ),
+
+          turn: s.turn,
+        }
+      );
+
+      return null;
+    }
+
+    const before = s.karma;
+
+    const outcome = fallback
+      ? {
+          delta:
+            candidate.delta,
+
+          consequence: {
+            casualties: 0,
+            saved: 0,
+            injured: 0,
+          },
+        }
+      : applyOutcome(
+          candidate,
+          output
+        );
+
+    const delta =
+      outcome.delta;
+
+    s.karma = clamp(
+      s.karma + delta,
+      AID_KARMA_CONFIG.min,
+      AID_KARMA_CONFIG.max
+    );
+
+    // Public reputation changes only when the action is publicly known.
+    if (
+      visibility === "public"
+    ) {
+      s.publicScore =
+        clamp(
+          s.publicScore +
+            delta,
+          -100,
+          100
+        );
+    }
+
+    const event = {
+      turn: s.turn,
+
+      delta,
+
+      before,
+
+      after: s.karma,
+
+      label:
+        candidate.description,
+
+      visibility,
+
+      rule:
+        candidate.rule.id,
+
+      attempted:
+        !!candidate.attempted,
+
+      casualties:
+        outcome.consequence
+          .casualties,
+
+      saved:
+        outcome.consequence
+          .saved,
+
+      injured:
+        outcome.consequence
+          .injured,
+
+      source:
+        cleanText(input).slice(
+          0,
+          180
+        ),
+    };
+
+    s.events.push(event);
+
+    if (
+      s.events.length >
+      AID_KARMA_CONFIG.maxEvents
+    ) {
+      s.events.splice(
+        0,
+        s.events.length -
+          AID_KARMA_CONFIG.maxEvents
+      );
+    }
+
+    if (
+      visibility !== "private"
+    ) {
+      s.deeds.push({
+        delta,
+
+        label:
+          candidate.description,
+
+        visibility,
+
+        turn: s.turn,
+      });
+
+      if (
+        s.deeds.length >
+        AID_KARMA_CONFIG.maxDeeds
+      ) {
+        s.deeds.splice(
+          0,
+          s.deeds.length -
+            AID_KARMA_CONFIG.maxDeeds
+        );
+      }
+    }
+
+    updateActiveScene(
+      s,
+      candidate,
+      input
+    );
+
+    rememberProcessed(
+      s,
+      eventKey
+    );
+
+    safeLog(
+      "event",
+      event
+    );
+
+    return event;
+  };
+
+  // ---------------------------------------------------------------------------
+  // Derived social state
+  // ---------------------------------------------------------------------------
+
+  const alignment = (
+    karma
+  ) => {
+    if (karma <= -70)
+      return "Villainous";
+
+    if (karma <= -30)
+      return "Ruthless";
+
+    if (karma < 30)
+      return "Neutral";
+
+    if (karma < 70)
+      return "Benevolent";
+
+    return "Heroic";
+  };
+
+  const reputation = (
+    s
+  ) => {
+    if (
+      !s.deeds.length &&
+      s.publicScore === 0
+    ) {
+      return "Unknown";
+    }
+
+    if (s.publicScore <= -70)
+      return "Infamous";
+
+    if (s.publicScore <= -30)
+      return "Feared";
+
+    if (s.publicScore < 30)
+      return "Unknown";
+
+    if (s.publicScore < 70)
+      return "Respected";
+
+    return "Admired";
+  };
+
+  const perception = (
+    s
+  ) => {
+    const score =
+      s.publicScore;
+
+    if (score <= -50)
+      return "Fear / Hostility";
+
+    if (score < 0)
+      return "Caution / Distrust";
+
+    if (score < 40)
+      return "Neutral";
+
+    if (score < 75)
+      return "Respect / Trust";
+
+    return "Admiration / Support";
+  };
+
+  const authorities = (
+    s
+  ) => {
+    if (s.karma <= -60)
+      return "Threat";
+
+    if (s.karma >= 40)
+      return "Cooperative";
+
+    return "Neutral";
+  };
+
+  const status = (s) => ({
+    karma: Math.round(
+      s.karma
+    ),
+
+    alignment:
+      alignment(s.karma),
+
+    reputation:
+      reputation(s),
+
+    perception:
+      perception(s),
+
+    authorities:
+      authorities(s),
+
+    publicScore:
+      Math.round(
+        s.publicScore
+      ),
+  });
+
+  // ---------------------------------------------------------------------------
+  // Story Card
+  // ---------------------------------------------------------------------------
+
+  const cardIndexFromState = (
+    s
+  ) => {
+    if (
+      !Array.isArray(
+        globalThis.storyCards
+      )
+    ) {
+      return -1;
+    }
+
+    if (
+      isNum(s.cardIndex) &&
+      storyCards[
+        s.cardIndex
+      ] &&
+      storyCards[
+        s.cardIndex
+      ].keys
+    ) {
+      const k =
+        storyCards[
+          s.cardIndex
+        ].keys;
+
+      if (
+        (Array.isArray(k) &&
+          k.indexOf(
+            SENTINEL
+          ) >= 0) ||
+        k === SENTINEL
+      ) {
+        return s.cardIndex;
+      }
+    }
+
+    for (
+      let i = 0;
+      i < storyCards.length;
+      i++
+    ) {
+      const card =
+        storyCards[i];
+
+      if (!card) continue;
+
+      const keys =
+        card.keys;
+
+      if (
+        (Array.isArray(keys) &&
+          keys.indexOf(
+            SENTINEL
+          ) >= 0) ||
+        keys === SENTINEL
+      ) {
+        return i;
+      }
+    }
+
+    return -1;
+  };
+
+  const renderCard = (
+    s
+  ) => {
+    const st =
+      status(s);
+
+    const lines = [
+      AID_KARMA_CONFIG.cardHeader,
+      "",
+      `KARMA: ${st.karma}`,
+      `MORAL ALIGNMENT: ${st.alignment}`,
+      `REPUTATION: ${st.reputation}`,
+      `PUBLIC PERCEPTION: ${st.perception}`,
+      `AUTHORITIES: ${st.authorities}`,
+      "",
+      "RECENT KARMA EVENTS:",
+    ];
+
+    const recent =
+      s.events
+        .slice(-8)
+        .reverse();
+
+    if (!recent.length) {
+      lines.push(
+        "No significant moral events recorded yet."
+      );
+    } else {
+      for (const e of recent) {
+        const sign =
+          e.delta >= 0
+            ? "+"
+            : "";
+
+        lines.push(
+          `${sign}${e.delta} — ${e.label} [${e.visibility}]`
+        );
+      }
+    }
+
+    lines.push(
+      "",
+      "IMPORTANT KNOWN DEEDS:"
+    );
+
+    const deeds =
+      s.deeds
+        .slice(-8)
+        .reverse();
+
+    if (!deeds.length) {
+      lines.push("None.");
+    } else {
+      for (const d of deeds) {
+        const mark =
+          d.visibility ===
+          "public"
+            ? "PUBLIC"
+            : "WITNESSED";
+
+        lines.push(
+          `• ${d.label} [${mark}]`
+        );
+      }
+    }
+
+    lines.push(
+      "",
+      "SYSTEM NOTE:",
+      "Karma tracks what the player actually did. Reputation and public perception reflect what other people can plausibly know."
+    );
+
+    return lines.join(
+      "\n"
+    );
+  };
+
+  // ---------------------------------------------------------------------------
+  // Story Card management
+  // ---------------------------------------------------------------------------
+
+  const ensureCard = (
+    s
+  ) => {
+    if (
+      !AID_KARMA_CONFIG.cardEnabled ||
+      !Array.isArray(
+        globalThis.storyCards
+      )
+    ) {
+      return;
+    }
+
+    try {
+      let idx =
+        cardIndexFromState(
+          s
+        );
+
+      const entry =
+        renderCard(s);
+
+      if (idx < 0) {
+        try {
+          addStoryCard(
+            SENTINEL,
+            entry,
+            AID_KARMA_CONFIG.cardType
+          );
+        } catch (err) {
+          safeLog(
+            "addStoryCard failed",
+            String(err)
+          );
+
+          return;
+        }
+
+        idx =
+          cardIndexFromState(
+            s
+          );
+      }
+
+      if (
+        idx < 0 &&
+        storyCards.length
+      ) {
+        const possible =
+          storyCards.length -
+          1;
+
+        if (
+          storyCards[
+            possible
+          ] &&
+          storyCards[
+            possible
+          ].keys ===
+            SENTINEL
+        ) {
+          idx = possible;
+        }
+      }
+
+      if (idx >= 0) {
+        s.cardIndex =
+          idx;
+
+        try {
+          updateStoryCard(
+            idx,
+            SENTINEL,
+            entry,
+            AID_KARMA_CONFIG.cardType
+          );
+        } catch (err) {
+          try {
+            storyCards[
+              idx
+            ].keys = SENTINEL;
+
+            storyCards[
+              idx
+            ].entry = entry;
+
+            storyCards[
+              idx
+            ].type =
+              AID_KARMA_CONFIG.cardType;
+          } catch (
+            inner
+          ) {
+            safeLog(
+              "card update failed",
+              String(inner)
+            );
+          }
+        }
+      }
+    } catch (err) {
+      safeLog(
+        "ensureCard failed",
+        String(err)
+      );
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // AI context / frontMemory
+  // ---------------------------------------------------------------------------
+
+  const buildAIBlock = (
+    s
+  ) => {
+    const st =
+      status(s);
+
+    const publicDeeds =
+      s.events
+        .filter(
+          (e) =>
+            e.visibility ===
+            "public"
+        )
+        .slice(-5)
+        .reverse();
+
+    const witnessed =
+      s.events
+        .filter(
+          (e) =>
+            e.visibility ===
+            "witnessed"
+        )
+        .slice(-3)
+        .reverse();
+
+    const lines = [
+      "[Persistent Karma & Reputation System]",
+
+      `Player moral state: Karma ${st.karma} (${st.alignment}).`,
+
+      `General reputation: ${st.reputation}. Public perception: ${st.perception}.`,
+
+      `Authorities: ${st.authorities}.`,
+
+      s.activeScene &&
+      s.activeScene.active
+        ? "A recent rescue/protection situation is active; related defensive actions should be treated as part of the same moral event unless clearly independent."
+        : "",
+
+      "Treat significant deeds below as established world facts.",
+
+      "NPCs may react to the player's reputation even without a Story Card, but specific knowledge must remain plausible.",
+
+      "Do not make every NPC mention the player's reputation; reveal it naturally through trust, admiration, fear, caution, support, avoidance, gossip, or cooperation.",
+
+      "Positive reputation can lead to spontaneous admiration, people offering help, defending the player, or seeking them out.",
+
+      "Negative reputation can lead to distrust, fear, refusal of help, people alerting authorities, or treating the player as dangerous.",
+
+      "Do not let NPCs know private deeds unless they witnessed them, were told, or have another plausible reason to know.",
+
+      "Do not change Karma merely because an NPC has an opinion. Only significant player actions tracked by this system change it.",
+    ];
+
+    if (
+      publicDeeds.length
+    ) {
+      lines.push(
+        "Publicly known deeds:"
+      );
+
+      for (
+        const e of publicDeeds
+      ) {
+        lines.push(
+          `- ${e.label}`
+        );
+      }
+    }
+
+    if (
+      witnessed.length
+    ) {
+      lines.push(
+        "Recent witnessed deeds (use only for NPCs plausibly present or informed):"
+      );
+
+      for (
+        const e of witnessed
+      ) {
+        lines.push(
+          `- ${e.label}`
+        );
+      }
+    }
+
+    return lines.join(
+      " "
+    );
+  };
+
+  const writeFrontMemory = (
+    s
+  ) => {
+    if (
+      !AID_KARMA_CONFIG.injectFrontMemory
+    ) {
+      return;
+    }
+
+    try {
+      if (
+        !state.memory ||
+        typeof state.memory !==
+          "object"
+      ) {
+        state.memory = {};
+      }
+
+      const block =
+        `${FRONT_START} ${buildAIBlock(s)} ${FRONT_END}`;
+
+      const existing =
+        typeof state.memory
+          .frontMemory ===
+        "string"
+          ? state.memory
+              .frontMemory
+          : "";
+
+      const withoutOld =
+        existing
+          .replace(
+            new RegExp(
+              `${escapeRegex(
+                FRONT_START
+              )}[\\s\\S]*?${escapeRegex(
+                FRONT_END
+              )}\\s*`,
+              "g"
+            ),
+            ""
+          )
+          .trim();
+
+      state.memory.frontMemory =
+        withoutOld
+          ? `${withoutOld} ${block}`
+          : block;
+    } catch (err) {
+      safeLog(
+        "frontMemory failed",
+        String(err)
+      );
+    }
+  };
+
+  const injectContext = (
+    text,
+    s
+  ) => {
+    const base =
+      String(text ?? "");
+
+    const clean =
+      base
+        .replace(
+          new RegExp(
+            `${escapeRegex(
+              CONTEXT_START
+            )}[\\s\\S]*?${escapeRegex(
+              CONTEXT_END
+            )}\\s*`,
+            "g"
+          ),
+          ""
+        )
+        .trim();
+
+    const block =
+      `${CONTEXT_START}\n${buildAIBlock(s)}\n${CONTEXT_END}`;
+
+    return clean
+      ? `${clean}\n\n${block}`
+      : block;
+  };
+
+  // ---------------------------------------------------------------------------
+  // Hook API
+  // ---------------------------------------------------------------------------
+
+  const input = (
+    text
+  ) => {
+    try {
+      const s =
+        ensureState();
+
+      const inputText =
+        cleanText(text);
+
+      const actionCount =
+        globalThis.info &&
+        isNum(
+          info.actionCount
+        )
+          ? info.actionCount
+          : s.turn + 1;
+
+      s.turn = Math.max(
+        s.turn,
+        actionCount
+      );
+
+      if (
+        s.activeScene &&
+        s.turn -
+            s.activeScene
+              .turn >
+          AID_KARMA_CONFIG.maxActiveSceneTurns
+      ) {
+        s.activeScene =
+          null;
+      }
+
+      // If the previous generation never reached Output,
+      // conservatively settle that pending action on the next player input.
+      if (
+        s.pending &&
+        s.pending.key &&
+        !s.pending.resolved
+      ) {
+        if (
+          !alreadyProcessed(
+            s,
+            s.pending.key
+          )
+        ) {
+          const candidates =
+            Array.isArray(
+              s.pending
+                .candidates
+            )
+              ? s.pending
+                  .candidates
+              : [];
+
+          for (
+            const raw of candidates
+          ) {
+            const c =
+              rebuildCandidate(
+                raw
+              );
+
+            if (c) {
+              addEvent(
+                s,
+                s.pending.input,
+                "",
+                c,
+                "witnessed",
+                `${s.pending.key}:${c.rule.id}`,
+                true
+              );
+            }
+          }
+        }
+
+        s.pending =
+          null;
+      }
+
+      const candidates =
+        detectCandidates(
+          inputText
+        );
+
+      const key =
+        `${actionCount}:${hash32(
+          inputText
+        )}`;
+
+      s.pending = {
+        key,
+
+        input:
+          inputText.slice(
+            0,
+            800
+          ),
+
+        candidates:
+          candidates.map(
+            (c) => ({
+              ruleId:
+                c.rule.id,
+
+              delta:
+                c.delta,
+
+              verb:
+                c.rule.verb ||
+                c.rule.label,
+
+              matched:
+                c.matched,
+
+              sentence:
+                c.sentence,
+
+              attempted:
+                c.attempted,
+
+              target:
+                c.target || "",
+
+              description:
+                c.description,
+            })
+          ),
+
+        resolved: false,
+      };
+
+      writeFrontMemory(
+        s
+      );
+
+      ensureCard(s);
+
+      safeLog(
+        "input",
+        {
+          turn: s.turn,
+          actionCount,
+          key,
+          candidates:
+            s.pending
+              .candidates,
+        }
+      );
+
+      return text;
+    } catch (err) {
+      safeLog(
+        "input error",
+        String(err)
+      );
+
+      return text || " ";
+    }
+  };
+
+  const context = (
+    text,
+    _stop
+  ) => {
+    try {
+      const s =
+        ensureState();
+
+      const finalText =
+        injectContext(
+          text,
+          s
+        );
+
+      safeLog(
+        "context",
+        {
+          karma: s.karma,
+        }
+      );
+
+      return {
+        text: finalText,
+        stop: false,
+      };
+    } catch (err) {
+      safeLog(
+        "context error",
+        String(err)
+      );
+
+      return {
+        text: text || "",
+        stop: false,
+      };
+    }
+  };
+
+  const rebuildCandidate = (
+    raw
+  ) => {
+    if (
+      !raw ||
+      typeof raw !==
+        "object"
+    ) {
+      return null;
+    }
+
+    const rule =
+      ACTION_RULES.find(
+        (r) =>
+          r.id ===
+          raw.ruleId
+      );
+
+    if (!rule) return null;
+
+    return {
+      rule,
+
+      delta: isNum(
+        raw.delta
+      )
+        ? raw.delta
+        : rule.delta,
+
+      verb:
+        raw.verb ||
+        rule.verb ||
+        rule.label,
+
+      matched:
+        raw.matched || "",
+
+      sentence:
+        raw.sentence || "",
+
+      attempted:
+        !!raw.attempted,
+
+      target:
+        raw.target || "",
+
+      description:
+        raw.description ||
+        (raw.attempted
+          ? `Attempted to ${
+              raw.verb ||
+              rule.verb ||
+              rule.label
+            }.`
+          : rule.label),
+    };
+  };
+
+  const output = (
+    text
+  ) => {
+    try {
+      const s =
+        ensureState();
+
+      const outText =
+        String(text ?? "");
+
+      if (
+        s.pending &&
+        s.pending.key
+      ) {
+        const actionKey =
+          s.pending.key;
+
+        if (
+          !alreadyProcessed(
+            s,
+            actionKey
+          )
+        ) {
+          let candidates =
+            (
+              s.pending
+                .candidates ||
+              []
+            )
+              .map(
+                rebuildCandidate
+              )
+              .filter(Boolean);
+
+          let sourceText =
+            s.pending.input;
+
+          // Fallback for vague player inputs such as "Do it".
+          // Generated narration can contain the explicit action.
+          if (
+            !candidates.length &&
+            /\b(?:you|i|the player|player character)\b/i.test(
+              outText
+            )
+          ) {
+            candidates =
+              detectCandidates(
+                outText
+              );
+
+            sourceText =
+              outText;
+          }
+
+          // If a rescue scene is active, allow the generated output
+          // to complete the same rescue sequence.
+          if (
+            !candidates.length &&
+            s.activeScene &&
+            s.activeScene.active &&
+            s.turn -
+                s.activeScene
+                  .turn <=
+              AID_KARMA_CONFIG.maxActiveSceneTurns
+          ) {
+            const rescueCandidates =
+              detectCandidates(
+                outText
+              ).filter(
+                (c) =>
+                  isRescueRule(c)
+              );
+
+            if (
+              rescueCandidates.length
+            ) {
+              candidates =
+                rescueCandidates;
+
+              sourceText =
+                outText;
+            }
+          }
+
+          const visibility =
+            inferVisibility(
+              sourceText,
+              outText
+            );
+
+          for (
+            const c of candidates
+          ) {
+            addEvent(
+              s,
+              sourceText,
+              outText,
+              c,
+              visibility,
+              `${actionKey}:${c.rule.id}`,
+              false
+            );
+          }
+
+          s.pending.resolved =
+            true;
+        }
+
+        s.pending =
+          null;
+      }
+
+      writeFrontMemory(
+        s
+      );
+
+      ensureCard(s);
+
+      safeLog(
+        "output",
+        status(s)
+      );
+
+      return text || " ";
+    } catch (err) {
+      safeLog(
+        "output error",
+        String(err)
+      );
+
+      return text || " ";
+    }
+  };
+
+  return {
+    input,
+    context,
+    output,
+
+    status: () =>
+      status(
+        ensureState()
+      ),
+
+    debugState: () =>
+      ensureState(),
+
+    buildAIBlock: () =>
+      buildAIBlock(
+        ensureState()
+      ),
+
+    renderCard: () =>
+      renderCard(
+        ensureState()
+      ),
+  };
+})();
