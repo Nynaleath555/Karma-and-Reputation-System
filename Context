@@ -1,0 +1,16 @@
+/// <reference no-default-lib="true"/>
+/// <reference lib="es2022"/>
+
+// ⚖️ KARMA & REPUTATION SYSTEM
+// Context hook
+
+const modifier = (text) => {
+  const result = AID_KARMA.context(text, false);
+
+  text = result.text;
+
+  return { text };
+};
+
+// Do not remove this line.
+modifier(text);
