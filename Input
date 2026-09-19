@@ -1,0 +1,13 @@
+/// <reference no-default-lib="true"/>
+/// <reference lib="es2022"/>
+
+// ⚖️ KARMA & REPUTATION SYSTEM
+// Input hook
+
+const modifier = (text) => {
+  text = AID_KARMA.input(text);
+  return { text };
+};
+
+// Do not remove this line.
+modifier(text);
