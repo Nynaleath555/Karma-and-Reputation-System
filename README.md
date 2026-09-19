@@ -1,4 +1,4 @@
-# ☯️⚖️ Karma & Reputation System
+# ☯️⚖️ Karma and Reputation System
 
 Make the player's actions matter.
 
