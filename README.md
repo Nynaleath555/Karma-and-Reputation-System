@@ -55,38 +55,20 @@ These reactions are not forced. The system provides the AI with the information 
 The goal is to make the player's previous decisions matter beyond the immediate scene.
 
 ---
-
 # ⚖️ Karma vs. Reputation
 
 The system separates several concepts that are often treated as the same thing.
 
-Karma
-
-What the player actually did.
-
-Moral Alignment
-
-The overall moral interpretation of the player's accumulated actions.
-
-Reputation
-
-How the player is generally perceived by society.
-
-Public Perception
-
-The emotional/social response the player's reputation tends to generate.
-
-Authorities
-
-The general relationship between the player and law enforcement or other authorities.
-
-Known Deeds
-
-Concrete events that NPCs can actually know about and potentially discuss.
+| Concept | Description |
+| --- | --- |
+| ⚖️ Karma | What the player actually did. |
+| 🧭 Moral Alignment | The overall moral interpretation of the player's accumulated actions. |
+| 🗣️ Reputation | How the player is generally perceived by society. |
+| 👥 Public Perception | The emotional/social response the player's reputation tends to generate. |
+| 🚔 Authorities | The general relationship between the player and law enforcement or other authorities. |
+| 📜 Known Deeds | Concrete events that NPCs can actually know about and potentially discuss. |
 
 This distinction is important because doing something good does not automatically mean everyone knows about it.
-
----
 
 # 🧠 Knowledge & NPC Reactions
 
